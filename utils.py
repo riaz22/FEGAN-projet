@@ -8,7 +8,8 @@ from torch import nn
 
 #Icomp generation
 def gen_to_comp(mask,gen,gt):
-    Icomp=torch.where(mask==1,gen,gt)
+    # threshold instead of exact equality: masks loaded from images are rarely exactly 1.0
+    Icomp=torch.where(mask>0.5,gen,gt)
     return Icomp
 
 
@@ -27,7 +28,10 @@ class GateConv(nn.Module):
         self.gate_conv = nn.Conv2d(
             im_chan, cnum, ksize, stride, dilation=rate,
             padding=padding, bias=True)
-        self.batch_norm=nn.BatchNorm2d(cnum)
+        # GroupNorm instead of BatchNorm: batch statistics at batch_size=4 are too
+        # noisy for GAN training, and unlike InstanceNorm it also works on the
+        # small spatial maps at the encoder bottleneck
+        self.norm=nn.GroupNorm(min(32,cnum),cnum)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
@@ -35,7 +39,7 @@ class GateConv(nn.Module):
         x_out = self.conv(x)
 
         if self.use_lrn:
-            x_out =self.batch_norm(x_out)
+            x_out =self.norm(x_out)
 
         if self.activation == 'leaky_relu':
             x_out = F.leaky_relu(x_out)

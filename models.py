@@ -135,6 +135,6 @@ class Discriminator(nn.Module):
         x = self.conv4(x)
         x = self.conv5(x)
         x = self.conv6(x)
-        x = torch.sigmoid(x)
+        # no sigmoid: the WGAN-GP/hinge critic must stay unbounded
         x = x.view(x.size(0), -1)
         return x
