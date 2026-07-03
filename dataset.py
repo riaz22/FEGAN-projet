@@ -5,14 +5,14 @@ import torchvision.transforms as transforms
 from torch.utils.data import Dataset
 
 class Custom_fegan_dataset(Dataset):
-    def __init__(self, root_dir):
+    def __init__(self, root_dir='/kaggle/input/celebhq-data'):
         self.root_dir = root_dir
-        self.image_input_dir = '/kaggle/input/celebhq-data/image_input/image_input'
-        self.color_input_dir = '/kaggle/input/celebhq-data/color_input/color_input'
-        self.mask_input_dir = '/kaggle/input/celebhq-data/mask_input/mask_input'
-        self.sketch_input_dir = '/kaggle/input/celebhq-data/sketch_input/sketch_input'
-        self.noise_input_dir = '/kaggle/input/celebhq-data/noise_input/noise_input'
-        self.ground_truth_dir = '/kaggle/input/celebhq-data/ground_truth/ground_truth'
+        self.image_input_dir = os.path.join(root_dir, 'image_input/image_input')
+        self.color_input_dir = os.path.join(root_dir, 'color_input/color_input')
+        self.mask_input_dir = os.path.join(root_dir, 'mask_input/mask_input')
+        self.sketch_input_dir = os.path.join(root_dir, 'sketch_input/sketch_input')
+        self.noise_input_dir = os.path.join(root_dir, 'noise_input/noise_input')
+        self.ground_truth_dir = os.path.join(root_dir, 'ground_truth/ground_truth')
 
         self.image_input_files = sorted(os.listdir(self.image_input_dir), key=lambda x: int(x.split('_')[-1].split('.')[0]))
         self.color_input_files = sorted(os.listdir(self.color_input_dir), key=lambda x: int(x.split('_')[-1].split('.')[0]))
@@ -72,9 +72,14 @@ class Custom_fegan_dataset(Dataset):
                                              color_input,
                                              self.convert_to_grayscale(noise_input))
 
-        mask_input = self.transform(self.convert_to_grayscale(mask_input))
+        # binarize the mask: values from image files are rarely exactly 0/1
+        mask_input = (self.transform(self.convert_to_grayscale(mask_input)) > 0.5).float()
         sketch_input = self.transform(self.convert_to_grayscale(sketch_input))
-        ground_truth = self.transform(ground_truth)
+        # images live in [-1,1] to match the generator's tanh output;
+        # mask/sketch/noise channels stay in [0,1]
+        ground_truth = self.transform(ground_truth) * 2 - 1
         generator_input=self.transform(generator_input)
+        generator_input[0:3] = generator_input[0:3] * 2 - 1  # masked image channels
+        generator_input[5:8] = generator_input[5:8] * 2 - 1  # color input channels
 
         return generator_input, mask_input, sketch_input, ground_truth

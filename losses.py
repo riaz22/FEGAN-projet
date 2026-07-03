@@ -1,14 +1,8 @@
 import torch
-import cv2
 from torch import nn
-#from torchsummary import summary
-from tqdm.auto import tqdm
 from torchvision import transforms
-from torchvision.utils import make_grid
 import torchvision.models as models
-from torch.utils.data import DataLoader
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 
 
 #WGAN Generator loss
@@ -18,7 +12,7 @@ class Gen_adv_loss(nn.Module):
     self.epsilon=epsilon
     self.beta=beta
     self.discriminator=discriminator
-  
+
   def forward(self,mask,sketch,comp,gt):
     comp=torch.cat((comp,mask,sketch),dim=1)
     gt=torch.cat((gt,mask,sketch),dim=1)
@@ -37,73 +31,52 @@ class Per_pixel_loss(nn.Module):
   def forward(self,M,generated,target):
     generated=generated.float()
     target=target.float()
-    c,h,w=target.size(1),target.size(2),target.size(3)
-    loss=(self.Criterion(M*generated,M*target))/(c*h*w)+self.alpha*(self.Criterion((1-M)*generated,(1-M)*target))/(c*h*w)
+    # L1Loss already averages over every element, so no extra /(c*h*w);
+    # alpha up-weights the edited region (M==1), which is where generation happens
+    loss=self.alpha*self.Criterion(M*generated,M*target)+self.Criterion((1-M)*generated,(1-M)*target)
     return loss
 
 # Perceptual and style losses
 class Perceptual_style_Losses(nn.Module):
   def __init__(self):
     super(Perceptual_style_Losses,self).__init__()
-    self.vgg16=models.vgg16(pretrained=True)
+    vgg16=models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
 
-    
-    self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     self.Criterion=nn.L1Loss()
-    self.pool1=nn.Sequential(*list(self.vgg16.features.children())[:5])#.to(self.device)
-    self.pool2=nn.Sequential(*list(self.vgg16.features.children())[:10])#.to(self.device)
-    self.pool3=nn.Sequential(*list(self.vgg16.features.children())[:17])#.to(self.device)
-    self.pool1=self.pool1.to(self.device)
-    self.pool2=self.pool2.to(self.device)
-    self.pool3=self.pool3.to(self.device)
+    self.pool1=nn.Sequential(*list(vgg16.features.children())[:5])
+    self.pool2=nn.Sequential(*list(vgg16.features.children())[:10])
+    self.pool3=nn.Sequential(*list(vgg16.features.children())[:17])
 
-    self.normalization_mean = torch.tensor([0.485, 0.456, 0.406]).to(self.device)
-    self.normalization_std = torch.tensor([0.229, 0.224, 0.225]).to(self.device)
+    self.register_buffer('normalization_mean', torch.tensor([0.485, 0.456, 0.406]).view(1,-1,1,1))
+    self.register_buffer('normalization_std', torch.tensor([0.229, 0.224, 0.225]).view(1,-1,1,1))
 
-    self.transform=transforms.Compose([
-        transforms.Resize((224, 224)),
-        #transforms.ToTensor(),
-        transforms.Normalize(self.normalization_mean, self.normalization_std)
-    ])
+    self.resize=transforms.Resize((224, 224))
 
-    for param in self.vgg16.parameters():
+    for param in self.parameters():
       param.requires_grad=False
+
   def normalize(self,x):
-      x=(x-0.5)/0.5
-      x = (x - self.normalization_mean.view(1, -1, 1, 1)) / self.normalization_std.view(1, -1, 1, 1)
+      # inputs live in [-1,1] (tanh range): map to [0,1] then to ImageNet statistics — exactly once
+      x=(x+1)/2
+      x=(x-self.normalization_mean)/self.normalization_std
       return x
 
-  def style_process(self,x,y):
-    x=x.view(x.size(0),x.size(1),-1)
-    x_transpose=x.transpose(1,2)
-    c,h,w=y.size(1),y.size(2),y.size(3)
-    y=y.view(y.size(0),y.size(1),-1)
-    y_transpose=y.transpose(1,2)
-    
-    
-    return self.Criterion(torch.matmul(x,x_transpose),torch.matmul(y,y_transpose))/(c*h*w*c*c)
+  def gram(self,feat):
+    b,c,h,w=feat.size()
+    feat=feat.view(b,c,h*w)
+    return torch.matmul(feat,feat.transpose(1,2))/(c*h*w)
 
   def forward(self,target,generated):
-      target=self.transform(target)
-      generated=self.transform(generated)
-      target=self.normalize(target)
-      generated=self.normalize(generated)
-      #percetual  loss
-      loss_percep1=self.Criterion(self.pool1(generated),self.pool1(target))/(self.pool1(target).size(1)*self.pool1(target).size(2)*self.pool1(target).size(3))
-      loss_percep2=self.Criterion(self.pool2(generated),self.pool2(target))/(self.pool2(target).size(1)*self.pool2(target).size(2)*self.pool2(target).size(3))
-      loss_percep3=self.Criterion(self.pool3(generated),self.pool3(target))/(self.pool3(target).size(1)*self.pool3(target).size(2)*self.pool3(target).size(3))
-      total_percep_loss=loss_percep1+loss_percep2+loss_percep3
+      target=self.normalize(self.resize(target))
+      generated=self.normalize(self.resize(generated))
 
-      #stype loss
-
-
-      loss_style1=self.style_process(self.pool1(generated),self.pool1(target))
-      loss_style2=self.style_process(self.pool2(generated),self.pool2(target))
-      loss_style3=self.style_process(self.pool3(generated),self.pool3(target))
-      total_style_loss=loss_style1+loss_style2+loss_style3
-
-
-
+      total_percep_loss=0
+      total_style_loss=0
+      for pool in (self.pool1,self.pool2,self.pool3):
+        feat_target=pool(target)
+        feat_generated=pool(generated)
+        total_percep_loss=total_percep_loss+self.Criterion(feat_generated,feat_target)
+        total_style_loss=total_style_loss+self.Criterion(self.gram(feat_generated),self.gram(feat_target))
 
       return total_percep_loss , total_style_loss
 
@@ -112,19 +85,18 @@ class Perceptual_style_Losses(nn.Module):
 class tv_loss(nn.Module):
     def __init__(self):
         super(tv_loss, self).__init__()
-        self.device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.dilation_conv = nn.Conv2d(1, 1, 3, padding=1, bias=False)
-        self.dilation_conv=self.dilation_conv.to(self.device)
         nn.init.constant_(self.dilation_conv.weight, 1.0)
+        self.dilation_conv.weight.requires_grad_(False)
 
     def forward(self, image, mask):
-        output_mask = self.dilation_conv(1 - mask)
-        output_mask=output_mask.to(self.device)
+        # mask==1 marks the edited region: dilate the mask itself so the loss
+        # covers the hole plus its boundary (not the complement of the hole)
+        output_mask = self.dilation_conv(mask)
         dilated_holes = (output_mask != 0).float()
         P = dilated_holes * image
-        c,h,w=image.size(1),image.size(2),image.size(3)
-        a = torch.mean(torch.abs(P[:, :, :, 1:] - P[:, :, :, :-1]))/(c*h*w)
-        b = torch.mean(torch.abs(P[:, :, 1:, :] - P[:, :, :-1, :]))/(c*h*w)
+        a = torch.mean(torch.abs(P[:, :, :, 1:] - P[:, :, :, :-1]))
+        b = torch.mean(torch.abs(P[:, :, 1:, :] - P[:, :, :-1, :]))
 
         total_variation_loss = a + b
         return total_variation_loss
@@ -137,7 +109,6 @@ class total_gen_loss(nn.Module):
     self.sigma=sigma
     self.gamma=gamma
     self.v=v
-    
 
 
     self.gen_adv_loss=Gen_adv_loss(self.discriminator)
@@ -150,13 +121,13 @@ class total_gen_loss(nn.Module):
     adversarial_loss=self.gen_adv_loss(mask,sketch,comp,gt)
     #Per pixel loss
     per_pixel_loss=self.per_pixel_loss(mask,gen,gt)
-    #Perceptual and styles losses 
+    #Perceptual and styles losses
     percep_gen_gt , style_gen_gt= self.percept_style_losses(gt,gen)
     percep_comp_gt , style_comp_gt= self.percept_style_losses(gt,comp)
 
     total_percept_loss= percep_gen_gt + percep_comp_gt
     total_style_loss= style_gen_gt + style_comp_gt
-    
+
     # total variation loss
     tv_loss=self.tv_loss(comp,mask)
 
@@ -175,20 +146,20 @@ class Gradient_penalty_loss(nn.Module):
   def __init__(self,Discriminator):
     super(Gradient_penalty_loss,self).__init__()
     self.Discriminator=Discriminator
-    self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
   def forward(self,mask,sketch,comp,GT):
       batch_size=GT.size(0)
-      alpha=torch.randn(batch_size,1,1,1)
-      alpha=alpha.to(self.device)
+      # uniform (not gaussian) interpolation factor so samples lie between real and fake
+      alpha=torch.rand(batch_size,1,1,1,device=GT.device)
       Igt=torch.cat((GT,mask,sketch),dim=1)
       Icomp=torch.cat((comp,mask,sketch),dim=1).detach()
       interpolated=alpha*Igt+(1-alpha)*Icomp
       interpolated.requires_grad_(True)
+      d_interpolated=self.Discriminator(interpolated,five_channels=True)
       #Calculate the gradients
       gradients=torch.autograd.grad(
-          outputs=self.Discriminator(interpolated,five_channels=True),
+          outputs=d_interpolated,
           inputs=interpolated,
-          grad_outputs=torch.ones_like(self.Discriminator(interpolated,five_channels=True)),
+          grad_outputs=torch.ones_like(d_interpolated),
           create_graph=True,
           retain_graph=True,
           only_inputs=True,
@@ -206,8 +177,9 @@ class disc_adv_loss(nn.Module):
   def forward(self,mask,sketch,comp,gt):
     comp=torch.cat((comp,mask,sketch),dim=1).detach()
     gt=torch.cat((gt,mask,sketch),dim=1)
-    comp_loss=torch.mean(1+self.discriminator(comp,five_channels=True))
-    gt_loss=torch.mean(1-self.discriminator(gt,five_channels=True))
+    # hinge loss: the relu stops well-classified samples from dominating the critic update
+    comp_loss=torch.mean(F.relu(1+self.discriminator(comp,five_channels=True)))
+    gt_loss=torch.mean(F.relu(1-self.discriminator(gt,five_channels=True)))
     return comp_loss+gt_loss
 #WGAN discriminator loss (Hinge Loss function)
 
@@ -221,7 +193,7 @@ class total_disc_loss(nn.Module):
 
 
   def forward(self,mask,sketch,comp,gt):
-    
+
     # Gradient penalty loss
     gp_loss=self.GP_loss(mask,sketch,comp,gt)
 
